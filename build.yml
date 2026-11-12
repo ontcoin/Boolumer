@@ -1,0 +1,149 @@
+name: Build Boolumer release APK + AAB (Play Store)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_PACKAGE: com.boolumer.stream
+    steps:
+      - uses: actions/checkout@v4
+
+      # Always-rising version code (Android blocks installs of a LOWER versionCode over a higher one; Play rejects repeats).
+      - name: Set version code
+        run: |
+          echo "VERSION_CODE=$((10000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          echo "versionCode will be $((10000 + GITHUB_RUN_NUMBER))"
+
+      # Works in both layouts: the project extracted in the repo root, OR a single project .zip committed to the repo.
+      - name: Locate the project
+        run: |
+          if ! find . \( -name settings.gradle -o -name settings.gradle.kts \) -not -path "./_project/*" | grep -q .; then
+            ZIP=$(ls ./*.zip 2>/dev/null | head -1 || true)
+            [ -n "$ZIP" ] && unzip -q "$ZIP" -d _project
+          fi
+          SETTINGS=$(find . \( -name settings.gradle -o -name settings.gradle.kts \) | head -1)
+          [ -n "$SETTINGS" ] || { echo "::error::settings.gradle(.kts) not found"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+
+      # AGP 8.11.x (used by this project) needs Gradle 8.13.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.13
+
+      # Use the key from GitHub secrets (KEYSTORE_BASE64) or a file committed as app/build.jks.
+      - name: Signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then echo "$KEYSTORE_BASE64" | base64 -d > app/build.jks; echo "Using the keystore from the KEYSTORE_BASE64 secret"; else echo "Using app/build.jks from the project"; fi
+          test -s app/build.jks || { echo "::error::app/build.jks is missing (add the KEYSTORE_BASE64 secret)"; exit 1; }
+
+      - name: Build signed APK and AAB
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          # Blank or missing values are ignored; gradle.properties is used instead.
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          gradle assembleRelease bundleRelease --no-daemon 2>&1 | tee build.log
+
+      # If the build fails, list the exact Kotlin/Gradle errors in the run summary and keep the full log.
+      - name: Show compile errors
+        if: failure()
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          {
+            echo "## Build errors"
+            echo '```'
+            grep -E "^e: |error:|FAILURE|What went wrong" -A2 build.log | grep -E "^e: |error:|What went wrong|> " | head -80 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boolumer-build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+
+      # If EXPECTED_SHA256.txt (SHA-256 of your permanent key) is in the project root, both files must match it.
+      # Without that file this step only prints the fingerprint, so you can copy it into EXPECTED_SHA256.txt.
+      - name: Verify both files are signed (permanent key)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" > apk-certs.txt
+          GOT_APK=$(grep "SHA-256 digest" apk-certs.txt | head -1 | sed 's/.*: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          GOT_AAB=$(keytool -printcert -jarfile "$AAB" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          echo "APK key SHA-256: $GOT_APK"; echo "AAB key SHA-256: $GOT_AAB"
+          "$APKSIGNER" verify --min-sdk-version 24 --max-sdk-version 36 "$APK" || { echo "::error::APK signature is not valid for Android 7 (API 24) to Android 16 (API 36)"; exit 1; }
+          [ "$GOT_APK" = "$GOT_AAB" ] || { echo "::error::APK and AAB are signed with different keys"; exit 1; }
+          if [ -f EXPECTED_SHA256.txt ]; then
+            WANT=$(tr -d ':\n ' < EXPECTED_SHA256.txt | tr 'a-f' 'A-F')
+            [ "$GOT_APK" = "$WANT" ] || { echo "::error::Not signed with the permanent key (expected $WANT)"; exit 1; }
+          else
+            echo "::warning::EXPECTED_SHA256.txt not found - add it with: $GOT_APK"
+          fi
+          echo "versionCode used: $VERSION_CODE"
+
+      - name: Verify Play Store requirements (APK + AAB)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -E "^package:|dkVersion|application-debuggable" badging.txt || true
+          grep -q "name='$EXPECTED_PACKAGE'" badging.txt || { echo "::error::Wrong package name (expected $EXPECTED_PACKAGE)"; exit 1; }
+          grep -qE "^(sdkVersion|minSdkVersion):'24'" badging.txt || { echo "::error::APK minSdk is not 24 (Android 7)"; exit 1; }
+          TARGET=$(grep "^targetSdkVersion" badging.txt | sed "s/[^0-9]//g")
+          [ "$TARGET" -ge 36 ] || { echo "::error::APK targetSdk is $TARGET, Play needs 36+"; exit 1; }
+          ! grep -q "application-debuggable" badging.txt || { echo "::error::APK is debuggable - Play rejects this"; exit 1; }
+          curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar
+          java -jar bundletool.jar validate --bundle="$AAB"
+          MINSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:minSdkVersion)
+          TGTSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:targetSdkVersion)
+          echo "AAB minSdk=$MINSDK targetSdk=$TGTSDK"
+          [ "$MINSDK" = "24" ] || { echo "::error::AAB minSdk is $MINSDK, expected 24"; exit 1; }
+          [ "$TGTSDK" -ge 36 ] || { echo "::error::AAB targetSdk is $TGTSDK, Play needs 36+"; exit 1; }
+          DEBUGGABLE=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/application/@android:debuggable 2>/dev/null || true)
+          [ "$DEBUGGABLE" != "true" ] || { echo "::error::AAB is debuggable - Play rejects this"; exit 1; }
+          jarsigner -verify "$AAB" | head -3
+          echo "All Play Store checks passed."
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boolumer-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+
+      - name: Upload AAB (for Google Play)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boolumer-AAB-for-PlayStore
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/bundle/release/*.aab
